@@ -24,10 +24,11 @@ struct JointReference {
 };
 
 struct LSCLRCConfig {
-    double dt = 0.001;           // 固定控制周期，滤波和历史积分使用同一周期
+    double dt = 0.001;           // 名义/最小采样周期；未指定sample_dt时使用此值
     double alpha = 5.0;          // 回归矩阵和力矩的共同滤波频率
     double tau_d = 3.0;          // 历史窗长度，单位s
-    double ie_threshold = 1e-6;
+    double ie_threshold = 1e-2;  // 满窗口达到此最小特征值时记录/保存IE批
+    double history_activation_threshold = 1e-2; // 实际学习矩阵的最小特征值门槛；0恢复旧门控
     double pinv_tolerance = 1e-9; // 绝对截断阈值，对应MATLAB pinv(Theta,tol)
     double parameter_bound = 10.0;
     bool freeze_on_ie = true;
@@ -67,7 +68,7 @@ struct LSCLRCDiagnostic {
     double best_sigma = 0.0;
     double ie_time = std::numeric_limits<double>::quiet_NaN();
     double history_fraction = 0.0;
-    double direct_learning_term_norm = 0.0;
+    double direct_learning_term_norm = 0.0; // 直接学习已禁用；保留诊断/CSV兼容，恒为零
     double history_learning_term_norm = 0.0;
     int information_rank = 0;   // 与MATLAB原诊断字段一致
     int pinv_rank = 0;          // 实际学习项中未被伪逆阈值截断的方向数

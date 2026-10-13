@@ -30,24 +30,26 @@ void PandaLSCLRC::reset()
     y_e.setZero();
     stored_information_rank = 0;
     stored_pinv_rank = 0;
+    stored_sigma_min = 0.0;
     history.reset();
     diagnostic = LSCLRCDiagnostic();
     diagnostic.W_hat = W_hat;
 }
 
-void PandaLSCLRC::update_filter(const JointVector& q, const JointVector& dq)
+void PandaLSCLRC::update_filter(const JointVector& q, const JointVector& dq, double dt,
+                              const JointVector& interval_torque)
 {
     diagnostic.acceleration_estimate.setZero();
     diagnostic.filter_sample_valid = has_previous_sample;
     if(has_previous_sample) {
         // 差分描述刚结束的采样区间，必须匹配上一周期的施加力矩。
-        diagnostic.acceleration_estimate = (dq - previous_dq) / config.dt;
+        diagnostic.acceleration_estimate = (dq - previous_dq) / dt;
         const RegressorMatrix Y_id = dynamics.inverse_regressor(
             q, dq, diagnostic.acceleration_estimate);
-        const double decay = std::exp(-config.alpha * config.dt);
+        const double decay = std::exp(-config.alpha * dt);
         const double gain = 1.0 - decay;
         Yf = decay * Yf + gain * Y_id;
-        tau_f = decay * tau_f + gain * previous_tau;
+        tau_f = decay * tau_f + gain * interval_torque;
     }
     previous_dq = dq;
     has_previous_sample = true;
@@ -93,11 +95,12 @@ void PandaLSCLRC::store_history(const InformationMatrix& Theta, const ParameterV
     const auto values = solver.eigenvalues().cwiseAbs().eval();
     const double tolerance = 1e-8 * std::max(1.0, values.maxCoeff());
     stored_information_rank = static_cast<int>((values.array() > tolerance).count());
+    stored_sigma_min = std::max(0.0, solver.eigenvalues().minCoeff());
 }
 
-void PandaLSCLRC::update_history(double t)
+void PandaLSCLRC::update_history(double t, double dt)
 {
-    history.step(Yf, tau_f);
+    history.step(Yf, tau_f, dt);
     const InformationMatrix& Theta = history.information();
     const ParameterVector& y = history.torque_integral();
     Eigen::SelfAdjointEigenSolver<InformationMatrix> solver(Theta, Eigen::EigenvaluesOnly);
@@ -145,14 +148,16 @@ void PandaLSCLRC::update_history(double t)
     const ParameterVector& y_use = use_frozen ? y_e : y;
     diagnostic.prediction_error = y_use - Theta_use * W_hat;
 
-    // 3. 满窗门控同时检查样本数与实际经过时间；不是必须先检测到IE。
+    // 3. 时间门控与激励门控独立；冻结后检查保存批，不能用当前窗替代。
     const bool full_duration_elapsed = t + time_tolerance >= config.tau_d;
     diagnostic.history_ready = !config.require_full_history_window
         || (history.full() && full_duration_elapsed);
     const bool has_information = Theta_use.norm() > 0;
+    const double learning_sigma_min = use_frozen ? stored_sigma_min : diagnostic.sigma_min;
+    const bool excitation_ready = learning_sigma_min >= config.history_activation_threshold;
     diagnostic.least_squares_term.setZero();
     diagnostic.pinv_rank = 0;
-    if(diagnostic.history_ready && has_information) {
+    if(diagnostic.history_ready && has_information && excitation_ready) {
         if(use_frozen) {
             diagnostic.least_squares_term = Theta_e_pinv * diagnostic.prediction_error;
             diagnostic.pinv_rank = stored_pinv_rank;
@@ -175,11 +180,11 @@ void PandaLSCLRC::update_history(double t)
     diagnostic.ie_time = ie_time;
     diagnostic.best_sigma = best_sigma;
     diagnostic.history_fraction = history.fraction();
-    diagnostic.history_update_active = diagnostic.history_ready && has_information;
+    diagnostic.history_update_active = diagnostic.history_ready && has_information && excitation_ready;
     diagnostic.using_frozen_history = use_frozen;
 }
 
-void PandaLSCLRC::update_parameters(const ParameterVector& raw_direction)
+void PandaLSCLRC::update_parameters(const ParameterVector& raw_direction, double dt)
 {
     // 对应project_parameter_step.m：先投影原方向，再左乘Gamma。
     ParameterVector projected = raw_direction;
@@ -197,7 +202,7 @@ void PandaLSCLRC::update_parameters(const ParameterVector& raw_direction)
         }
     }
     diagnostic.W_dot = config.Gamma * projected;
-    W_hat += config.dt * diagnostic.W_dot;
+    W_hat += dt * diagnostic.W_dot;
     if(!W_hat.allFinite()) {
         throw std::runtime_error("Parameter update contains non-finite values.");
     }
@@ -211,14 +216,22 @@ JointVector PandaLSCLRC::compute_control(
     double t,
     const JointVector& q,
     const JointVector& dq,
-    const JointReference& reference)
+    const JointReference& reference,
+    double sample_dt,
+    const JointVector* interval_torque)
 {
+    const double dt = sample_dt == 0.0 ? config.dt : sample_dt;
+    if(!std::isfinite(dt) || dt <= 0 || dt < config.dt - 1e-12 || dt > config.tau_d
+        || (interval_torque != nullptr && !interval_torque->allFinite())) {
+        throw std::invalid_argument("LS-CLRC sample period or interval torque is invalid.");
+    }
     if(!std::isfinite(t) || t < 0 || !q.allFinite() || !dq.allFinite()
         || !reference.q.allFinite() || !reference.dq.allFinite() || !reference.ddq.allFinite()) {
         throw std::invalid_argument("LS-CLRC measurement or reference is invalid.");
     }
-    if(previous_time >= 0 && std::abs(t - previous_time - config.dt) > 1e-8 * std::max(1.0, t)) {
-        throw std::invalid_argument("LS-CLRC requires a fixed control timestep; call reset before restarting.");
+    if(previous_time >= 0 && (t <= previous_time
+        || std::abs(t - previous_time - dt) > 1e-8 * std::max(1.0, t))) {
+        throw std::invalid_argument("LS-CLRC timestamp must match sample_dt; call reset before restarting.");
     }
 
     // 1. 论文式(5)：tau = e1 + K2*e2 + Y*W_hat，使用更新前参数。
@@ -239,7 +252,7 @@ JointVector PandaLSCLRC::compute_control(
         const double limited = std::clamp(diagnostic.raw_torque(joint),
             -config.torque_limit(joint), config.torque_limit(joint));
         if(std::isfinite(config.torque_rate_limit(joint))) {
-            const double delta = config.torque_rate_limit(joint) * config.dt;
+            const double delta = config.torque_rate_limit(joint) * dt;
             tau(joint) = std::clamp(limited, previous_tau(joint) - delta, previous_tau(joint) + delta);
         } else {
             tau(joint) = limited;
@@ -247,15 +260,14 @@ JointVector PandaLSCLRC::compute_control(
     }
 
     // 2. 共同滤波 -> 在线历史积分 -> 选择历史批 -> 最小二乘调制。
-    update_filter(q, dq);
-    update_history(t);
+    update_filter(q, dq, dt, interval_torque == nullptr ? previous_tau : *interval_torque);
+    update_history(t, dt);
 
-    // 3. 论文式(12)：Gamma*Proj(Y'*e2 + Kw*Theta_use^+*epsilon)。
-    const ParameterVector direct_term = Y.transpose() * diagnostic.filtered_error;
+    // 3. 直接学习项 Phi*0_(7x7)*e2 恒为零，仅保留复合学习方向。
     const ParameterVector history_term = config.Kw * diagnostic.least_squares_term;
-    diagnostic.direct_learning_term_norm = direct_term.norm();
+    diagnostic.direct_learning_term_norm = 0.0;
     diagnostic.history_learning_term_norm = history_term.norm();
-    update_parameters(direct_term + history_term);
+    update_parameters(history_term, dt);
     previous_tau = tau;
     previous_time = t;
     return tau;

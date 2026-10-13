@@ -16,17 +16,17 @@ LSCLRCConfig::LSCLRCConfig()
     Gamma = 0.3 * InformationMatrix::Identity();
     Kw = 2.5 * InformationMatrix::Identity();
 
-    // MATLAB的LS配置不限制力矩；默认禁用额外的接口限速。
-    // 调用方可在构造控制器前配置正的有限限制。
-    torque_limit.setConstant(std::numeric_limits<double>::infinity());
+    // Panda七轴默认力矩上限；额外的接口限速仍由实机入口显式开启。
+    torque_limit << 87, 87, 87, 87, 12, 12, 12;
     torque_rate_limit.setConstant(std::numeric_limits<double>::infinity());
 }
 
 void LSCLRCConfig::validate() const
 {
-    if(!std::isfinite(dt) || dt <= 0 || !std::isfinite(tau_d) || tau_d <= 0
+    if(!std::isfinite(dt) || dt <= 0 || !std::isfinite(tau_d) || tau_d < dt
         || tau_d / dt > 1000000 || !std::isfinite(alpha) || alpha <= 0
         || !std::isfinite(ie_threshold) || ie_threshold <= 0
+        || !std::isfinite(history_activation_threshold) || history_activation_threshold < 0
         || !std::isfinite(pinv_tolerance) || pinv_tolerance < 0
         || std::isnan(parameter_bound) || parameter_bound <= 0) {
         throw std::invalid_argument("LS-CLRC scalar configuration is invalid.");

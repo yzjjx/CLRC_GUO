@@ -27,12 +27,14 @@ private:
     ParameterVector y_e = ParameterVector::Zero();
     int stored_information_rank = 0;
     int stored_pinv_rank = 0;
+    double stored_sigma_min = 0.0;
     LSCLRCDiagnostic diagnostic;
 
-    void update_filter(const JointVector& q, const JointVector& dq);
-    void update_history(double t);
+    void update_filter(const JointVector& q, const JointVector& dq, double dt,
+                       const JointVector& interval_torque);
+    void update_history(double t, double dt);
     void store_history(const InformationMatrix& Theta, const ParameterVector& y);
-    void update_parameters(const ParameterVector& raw_direction);
+    void update_parameters(const ParameterVector& raw_direction, double dt);
 
     // Theta是对称历史信息矩阵，特征分解实现其Moore-Penrose伪逆。
     InformationMatrix pseudo_inverse(const InformationMatrix& Theta, int& rank) const;
@@ -49,7 +51,9 @@ public:
         double t,
         const JointVector& q,
         const JointVector& dq,
-        const JointReference& reference);
+        const JointReference& reference,
+        double sample_dt = 0.0,
+        const JointVector* interval_torque = nullptr); // 刚结束区间的平均总力矩
 
     // 执行端再次处理指令时，回写与辨识模型定义一致的最终施加力矩。
     void set_applied_torque(const JointVector& tau);
